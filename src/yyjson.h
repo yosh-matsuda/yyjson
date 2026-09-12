@@ -110,6 +110,13 @@
 /* auto detected in yyjson.c */
 #endif
 
+/* Define as 1 to disable SIMD optimizations at compile-time.
+    Normally, SIMD paths are enabled only when supported by the target compiler
+    and architecture. */
+#ifndef YYJSON_DISABLE_SIMD
+#define YYJSON_DISABLE_SIMD 0
+#endif
+
 /* Define to an integer to set a depth limit for reading nested arrays/objects.
    0 disables the policy limit. */
 #ifndef YYJSON_READER_DEPTH_LIMIT
