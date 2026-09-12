@@ -121,8 +121,20 @@ uint32_t yyjson_version(void) {
 #   define YYJSON_HAS_SIMD_SSE2 0
 #endif
 
+#undef YYJSON_HAS_SIMD_AVX2
+#if YYJSON_HAS_SIMD_SSE2 && \
+    (!defined(YYJSON_DISABLE_AVX2) || !YYJSON_DISABLE_AVX2) && \
+    (defined(__AVX2__) || defined(_M_AVX2))
+#   define YYJSON_HAS_SIMD_AVX2 1
+#else
+#   define YYJSON_HAS_SIMD_AVX2 0
+#endif
+
 #if YYJSON_HAS_SIMD_SSE2
 #   include <emmintrin.h>
+#endif
+#if YYJSON_HAS_SIMD_AVX2
+#   include <immintrin.h>
 #endif
 
 /* int128 type */
@@ -2113,6 +2125,28 @@ typedef struct { u8 *src; u8 *dst; } str_pos_pair;
     the quote, the backslash, a control character or a non-ASCII byte.
     Bytes >= 0x80 are negative as signed, so a single signed compare covers
     both control characters and non-ASCII bytes. */
+#if YYJSON_HAS_SIMD_AVX2
+static_inline u32 str_stop_mask_avx2(__m256i chunk) {
+    /*
+     The quote and the backslash are matched with a byte shuffle instead of two
+     compares: indexing the table with a byte yields that byte again only for
+     0x22 and 0x5C, since every other entry has a different low nibble. The
+     zero entries can only match a null byte, which stops the run anyway, and
+     a byte >= 0x80 shuffles in a zero and is caught by the compare below.
+     This keeps the whole test at two vector constants, which the compiler can
+     set up in far fewer instructions than three.
+     */
+    __m256i table = _mm256_setr_epi8(
+        0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, 0,
+        0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, 0);
+    __m256i limit = _mm256_set1_epi8(0x20);
+    __m256i quote_or_slash =
+        _mm256_cmpeq_epi8(chunk, _mm256_shuffle_epi8(table, chunk));
+    __m256i ctrl_or_non_ascii = _mm256_cmpgt_epi8(limit, chunk);
+    return (u32)_mm256_movemask_epi8(
+        _mm256_or_si256(quote_or_slash, ctrl_or_non_ascii));
+}
+#else
 static_inline u32 str_stop_mask_sse2(__m128i chunk) {
     __m128i quote = _mm_set1_epi8('"');
     __m128i slash = _mm_set1_epi8('\\');
@@ -2123,6 +2157,7 @@ static_inline u32 str_stop_mask_sse2(__m128i chunk) {
     return (u32)_mm_movemask_epi8(_mm_or_si128(
         _mm_or_si128(quote_mask, slash_mask), ctrl_or_non_ascii));
 }
+#endif
 
 /**
  Skips whole SIMD chunks of a double-quoted string that contain no quote,
@@ -2137,8 +2172,38 @@ static_inline u32 str_stop_mask_sse2(__m128i chunk) {
  resolve the final bytes with its scalar unrolled loop, whose exits are likewise
  constant offsets. This keeps short strings as fast as the scalar-only build
  while long strings still get the full SIMD throughput.
+
+ Only the widest available chunk size is used. A narrower fallback pass would
+ only ever apply to the last few bytes of the input, while its extra inlined
+ code makes the whole string parser measurably slower.
  */
 static_inline u8 *str_ascii_skip_chunks(u8 *src, u8 *eof) {
+#if YYJSON_HAS_SIMD_AVX2
+    if (simd_chunk_fits(src, eof, 32)) {
+        u8 *last = simd_chunk_last(eof, 32);
+        do {
+            __m256i chunk =
+                _mm256_loadu_si256((const __m256i *)(const void *)src);
+            u32 mask = str_stop_mask_avx2(chunk);
+            if (mask) {
+                keep_branch();
+#if YYJSON_IS_REAL_GCC
+                /* Narrow the hit down to the 16-byte half that holds it, so
+                   the caller's 16-byte scalar round never rescans a clean
+                   half. Testing the mask that was computed anyway keeps this
+                   a predicted branch plus a constant add.
+
+                   This is a pure hint, the caller resolves the same bytes
+                   without it. Only GCC profits: Clang generates markedly worse
+                   code around the refinement for strings of 16 to 48 bytes. */
+                if (!(mask & 0xFFFF)) src += 16;
+#endif
+                break;
+            }
+            src += 32;
+        } while (src <= last);
+    }
+#else
     if (simd_chunk_fits(src, eof, 16)) {
         u8 *last = simd_chunk_last(eof, 16);
         do {
@@ -2148,6 +2213,7 @@ static_inline u8 *str_ascii_skip_chunks(u8 *src, u8 *eof) {
             src += 16;
         } while (src <= last);
     }
+#endif
     return src;
 }
 
@@ -2156,6 +2222,32 @@ static_inline u8 *str_ascii_skip_chunks(u8 *src, u8 *eof) {
     The positions are returned by value to keep them in the caller's registers. */
 static_inline str_pos_pair str_ascii_copy_chunks(u8 *src, u8 *dst, u8 *eof) {
     str_pos_pair pos;
+#if YYJSON_HAS_SIMD_AVX2
+    if (simd_chunk_fits(src, eof, 32)) {
+        u8 *last = simd_chunk_last(eof, 32);
+        do {
+            __m256i chunk =
+                _mm256_loadu_si256((const __m256i *)(const void *)src);
+            u32 mask = str_stop_mask_avx2(chunk);
+            if (mask) {
+                keep_branch();
+#if YYJSON_IS_REAL_GCC
+                /* See the matching comment in str_ascii_skip_chunks(). */
+                if (!(mask & 0xFFFF)) {
+                    _mm_storeu_si128((__m128i *)(void *)dst,
+                                     _mm256_castsi256_si128(chunk));
+                    src += 16;
+                    dst += 16;
+                }
+#endif
+                break;
+            }
+            _mm256_storeu_si256((__m256i *)(void *)dst, chunk);
+            src += 32;
+            dst += 32;
+        } while (src <= last);
+    }
+#else
     if (simd_chunk_fits(src, eof, 16)) {
         u8 *last = simd_chunk_last(eof, 16);
         do {
@@ -2167,6 +2259,7 @@ static_inline str_pos_pair str_ascii_copy_chunks(u8 *src, u8 *dst, u8 *eof) {
             dst += 16;
         } while (src <= last);
     }
+#endif
     pos.src = src;
     pos.dst = dst;
     return pos;
