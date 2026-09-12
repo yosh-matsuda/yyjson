@@ -108,6 +108,23 @@ uint32_t yyjson_version(void) {
 #   define GCC_HAS_CTZLL 0
 #endif
 
+/* SIMD support: enabled only when the compiler targets an available ISA. */
+#undef YYJSON_HAS_SIMD_SSE2
+#if !YYJSON_FREESTANDING && \
+    (!defined(YYJSON_DISABLE_SIMD) || !YYJSON_DISABLE_SIMD) && \
+    (!defined(YYJSON_DISABLE_UNALIGNED_MEMORY_ACCESS) || \
+    !YYJSON_DISABLE_UNALIGNED_MEMORY_ACCESS) && \
+    (defined(__SSE2__) || defined(_M_X64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#   define YYJSON_HAS_SIMD_SSE2 1
+#else
+#   define YYJSON_HAS_SIMD_SSE2 0
+#endif
+
+#if YYJSON_HAS_SIMD_SSE2
+#   include <emmintrin.h>
+#endif
+
 /* int128 type */
 #ifndef YYJSON_HAS_INT128
 #   if defined(__SIZEOF_INT128__) && (__SIZEOF_INT128__ == 16) && \
@@ -412,6 +429,21 @@ uint32_t yyjson_version(void) {
 #   define gcc_load_barrier(val)
 #   define gcc_store_barrier(val)
 #   define gcc_full_barrier(val)
+#endif
+
+/**
+ Prevents the compiler from turning the enclosing branch into a conditional
+ move. It does not emit any instruction.
+
+ This is needed where a branch guards the update of a value that the branch
+ condition itself is computed from. Predicating such an update places the whole
+ computation of the condition on the loop-carried dependency chain, which is far
+ more expensive than a mispredicted branch when the branch is highly biased.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#   define keep_branch() __asm__ volatile("")
+#else
+#   define keep_branch()
 #endif
 
 
@@ -2053,6 +2085,94 @@ static_inline u32 u64_tz_bits(u64 v) {
     return table[((v & (~v + 1)) * U64(0x022FDD63, 0xCC95386D)) >> 58];
 #endif
 }
+
+#if YYJSON_HAS_SIMD_SSE2
+
+/** A pair of read/write positions in a string. */
+typedef struct { u8 *src; u8 *dst; } str_pos_pair;
+
+/**
+ Returns whether a SIMD chunk of `size` bytes can be loaded at `src`.
+
+ The input buffer is padded with `YYJSON_PADDING_SIZE` zeroed bytes, so a chunk
+ may overrun `eof` by at most that amount. A single signed comparison is used
+ here: if `src` is past `eof`, the difference is negative and the test fails,
+ so no separate `src <= eof` branch is required.
+ */
+#define simd_chunk_fits(src, eof, size) \
+    ((eof) - (src) >= (ptrdiff_t)((size) - YYJSON_PADDING_SIZE))
+
+/** Returns the last position a SIMD chunk of `size` bytes may be loaded at.
+    Only valid when `simd_chunk_fits()` holds, which keeps the result inside
+    the input buffer. Hoisting it out of a scan loop turns the bound check
+    into a single compare against a loop-invariant pointer. */
+#define simd_chunk_last(eof, size) \
+    ((eof) - (ptrdiff_t)((size) - YYJSON_PADDING_SIZE))
+
+/** Returns a bitmask of bytes that end a double-quoted ASCII run:
+    the quote, the backslash, a control character or a non-ASCII byte.
+    Bytes >= 0x80 are negative as signed, so a single signed compare covers
+    both control characters and non-ASCII bytes. */
+static_inline u32 str_stop_mask_sse2(__m128i chunk) {
+    __m128i quote = _mm_set1_epi8('"');
+    __m128i slash = _mm_set1_epi8('\\');
+    __m128i limit = _mm_set1_epi8(0x20);
+    __m128i quote_mask = _mm_cmpeq_epi8(chunk, quote);
+    __m128i slash_mask = _mm_cmpeq_epi8(chunk, slash);
+    __m128i ctrl_or_non_ascii = _mm_cmplt_epi8(chunk, limit);
+    return (u32)_mm_movemask_epi8(_mm_or_si128(
+        _mm_or_si128(quote_mask, slash_mask), ctrl_or_non_ascii));
+}
+
+/**
+ Skips whole SIMD chunks of a double-quoted string that contain no quote,
+ backslash, control character or non-ASCII byte, and returns the position of
+ the first chunk that does (or the last position a chunk could be loaded at).
+
+ The exact stop position inside that chunk is deliberately *not* computed here.
+ Deriving it would require `src += count_trailing_zeros(mask)`, which puts the
+ whole load -> compare -> movemask -> tzcnt chain on the loop-carried dependency
+ that runs through every string of the document. Instead the mask only steers a
+ branch, so `src` always advances by a compile-time constant and the caller can
+ resolve the final bytes with its scalar unrolled loop, whose exits are likewise
+ constant offsets. This keeps short strings as fast as the scalar-only build
+ while long strings still get the full SIMD throughput.
+ */
+static_inline u8 *str_ascii_skip_chunks(u8 *src, u8 *eof) {
+    if (simd_chunk_fits(src, eof, 16)) {
+        u8 *last = simd_chunk_last(eof, 16);
+        do {
+            __m128i chunk =
+                _mm_loadu_si128((const __m128i *)(const void *)src);
+            if (str_stop_mask_sse2(chunk)) { keep_branch(); break; }
+            src += 16;
+        } while (src <= last);
+    }
+    return src;
+}
+
+/** Copies whole SIMD chunks of a double-quoted string that contain no quote,
+    backslash, control character or non-ASCII byte, see str_ascii_skip_chunks().
+    The positions are returned by value to keep them in the caller's registers. */
+static_inline str_pos_pair str_ascii_copy_chunks(u8 *src, u8 *dst, u8 *eof) {
+    str_pos_pair pos;
+    if (simd_chunk_fits(src, eof, 16)) {
+        u8 *last = simd_chunk_last(eof, 16);
+        do {
+            __m128i chunk =
+                _mm_loadu_si128((const __m128i *)(const void *)src);
+            if (str_stop_mask_sse2(chunk)) { keep_branch(); break; }
+            _mm_storeu_si128((__m128i *)(void *)dst, chunk);
+            src += 16;
+            dst += 16;
+        } while (src <= last);
+    }
+    pos.src = src;
+    pos.dst = dst;
+    return pos;
+}
+
+#endif
 
 /** Multiplies two 64-bit unsigned integers (a * b),
     returns the 128-bit result as 'hi' and 'lo'. */
@@ -4750,6 +4870,13 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #undef return_err
 }
 
+#if YYJSON_HAS_SIMD_SSE2
+static_inline bool read_str_copy(u8 quo, u8 *hdr, u8 **end, u8 *src,
+                                 u8 *dst, u8 *eof, yyjson_read_flag flg,
+                                 yyjson_val *val, const char **msg,
+                                 u8 *con[2], bool resume);
+#endif
+
 /**
  Read a JSON string.
  @param quo The quote character (single quote or double quote).
@@ -4788,7 +4915,12 @@ static_inline bool read_str_opt(u8 quo, u8 **ptr, u8 *eof, yyjson_read_flag flg,
     if (con && unlikely(con[0])) {
         src = con[0];
         dst = con[1];
+#if YYJSON_HAS_SIMD_SSE2
+        if (dst) return read_str_copy(quo, hdr, end, src, dst, eof, flg,
+                                      val, msg, con, true);
+#else
         if (dst) goto copy_ascii;
+#endif
     }
 
 skip_ascii:
@@ -4817,6 +4949,15 @@ skip_ascii:
 
     repeat16_incr(expr_jump)
     src += 16;
+#if YYJSON_HAS_SIMD_SSE2
+    /*
+     Only strings longer than this first unrolled round reach the SIMD scan,
+     so short strings keep the exact cost of the scalar-only build.
+     The scan merely reports which chunk holds the terminator; the unrolled
+     round above resolves the exact byte. See str_ascii_skip_chunks().
+     */
+    src = str_ascii_skip_chunks(src, eof);
+#endif
     goto skip_ascii;
     repeat16_incr(expr_stop)
 
@@ -4900,8 +5041,36 @@ skip_utf8:
         goto skip_ascii;
     }
 
-    /* The escape character appears, we need to copy it. */
+#if YYJSON_HAS_SIMD_SSE2
+    return read_str_copy(quo, hdr, end, src, src, eof, flg, val, msg, con,
+                         false);
+#undef return_err
+}
+
+/** Read the remainder of a JSON string that contains escaped characters. */
+static_inline bool read_str_copy(u8 quo, u8 *hdr, u8 **end, u8 *src,
+                                 u8 *dst, u8 *eof, yyjson_read_flag flg,
+                                 yyjson_val *val, const char **msg,
+                                 u8 *con[2], bool resume) {
+#define return_err(_end, _msg) do { \
+    *msg = _msg; \
+    *end = _end; \
+    if (con) { con[0] = _end; con[1] = dst; } \
+    return false; \
+} while (false)
+
+    u8 *pos;
+    u32 uni, tmp;
+
+    /* Resuming incremental parsing continues the ASCII copy loop, matching
+       the non-SIMD build where `read_str_opt` jumps directly to `copy_ascii`.
+       Entering at `copy_escape` would misread a plain ASCII byte as a
+       control character. */
+    if (unlikely(resume)) goto copy_ascii;
+#else
     dst = src;
+#endif
+
 copy_escape:
     if (likely(*src == '\\')) {
         switch (*++src) {
@@ -4981,6 +5150,7 @@ copy_escape:
         *dst++ = *src++;
     }
 
+    goto copy_ascii;
 copy_ascii:
     /*
      Copy continuous ASCII, loop unrolling, same as the following code:
@@ -5006,6 +5176,14 @@ copy_ascii:
 
     byte_move_16(dst, src);
     dst += 16; src += 16;
+#if YYJSON_HAS_SIMD_SSE2
+    /* See the matching comment in the skip loop of `read_str_opt()`. */
+    if (quo == '"') {
+        str_pos_pair simd_pos = str_ascii_copy_chunks(src, dst, eof);
+        src = simd_pos.src;
+        dst = simd_pos.dst;
+    }
+#endif
     goto copy_ascii;
 
     /*
