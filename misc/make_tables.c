@@ -381,6 +381,37 @@ static void make_hex_conv_table(void) {
 
 /*----------------------------------------------------------------------------*/
 
+static void make_esc_conv_table(void) {
+    u8 table[256] = {0};
+
+    table['"'] = '"';
+    table['\\'] = '\\';
+    table['/'] = '/';
+    table['b'] = '\b';
+    table['f'] = '\f';
+    table['n'] = '\n';
+    table['r'] = '\r';
+    table['t'] = '\t';
+
+    int table_len = 256;
+    int line_len = 8;
+    printf("static const u8 esc_conv_table[256] = {\n");
+    for (int i = 0; i < table_len; i++) {
+        bool is_head = ((i % line_len) == 0);
+        bool is_tail = ((i % line_len) == line_len - 1);
+        bool is_last = i + 1 == table_len;
+
+        if (is_head) printf("    ");
+        printf("0x%.2X", table[i]);
+        if (i + 1 < table_len) printf(",");
+        if (!is_tail && !is_last) printf(" "); else printf("\n");
+    }
+    printf("};\n");
+    printf("\n");
+}
+
+/*----------------------------------------------------------------------------*/
+
 static void make_u64_pow10_table(void) {
     int table_len = 20;
     int line_len = 2;
@@ -556,6 +587,7 @@ int main(void) {
     make_dec_trailing_zero_table();
     make_char_table();
     make_hex_conv_table();
+    make_esc_conv_table();
     make_u64_pow10_table();
     make_enc_table();
     make_esc_hex_char_table();

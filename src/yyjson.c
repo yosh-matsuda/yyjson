@@ -1125,6 +1125,47 @@ static const u8 hex_conv_table[256] = {
     0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0
 };
 
+/**
+ This table is used to convert a two-character escape sequence to a byte.
+ The character following the backslash is mapped to the byte it produces;
+ every other character, including `u`, is mapped to zero.
+ (generated with misc/make_tables.c)
+ */
+static const u8 esc_conv_table[256] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2F,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x5C, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x0C, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00,
+    0x00, 0x00, 0x0D, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
 /** Load 4 hex characters to `u16`, return true on valid input. */
 static_inline bool hex_load_4(const u8 *src, u16 *dst) {
     u16 c0 = hex_conv_table[src[0]];
@@ -5260,67 +5301,61 @@ static_inline bool read_str_copy(u8 quo, u8 *hdr, u8 **end, u8 *src,
 
 copy_escape:
     if (likely(*src == '\\')) {
-        switch (*++src) {
-            case '"':  *dst++ = '"';  src++; break;
-            case '\\': *dst++ = '\\'; src++; break;
-            case '/':  *dst++ = '/';  src++; break;
-            case 'b':  *dst++ = '\b'; src++; break;
-            case 'f':  *dst++ = '\f'; src++; break;
-            case 'n':  *dst++ = '\n'; src++; break;
-            case 'r':  *dst++ = '\r'; src++; break;
-            case 't':  *dst++ = '\t'; src++; break;
-            case 'u':
-                src--;
-                if (!read_uni_esc(&src, &dst, msg)) return_err(src, *msg);
-                break;
-            default: {
-                if (has_allow(EXT_ESCAPE)) {
-                    /* read extended escape (non-standard) */
-                    switch (*src) {
-                        case '\'': *dst++ = '\''; src++; break;
-                        case 'a':  *dst++ = '\a'; src++; break;
-                        case 'v':  *dst++ = '\v'; src++; break;
-                        case '?':  *dst++ = '\?'; src++; break;
-                        case 'e':  *dst++ = 0x1B; src++; break;
-                        case '0':
-                            if (!char_is_digit(src[1])) {
-                                *dst++ = '\0'; src++; break;
-                            }
-                            return_err(src - 1, "octal escape is not allowed");
-                        case '1': case '2': case '3': case '4':
-                        case '5': case '6': case '7': case '8': case '9':
-                            return_err(src - 1, "invalid number escape");
-                        case 'x': {
-                            u8 c;
-                            if (hex_load_2(src + 1, &c)) {
-                                src += 3;
-                                if (c <= 0x7F) { /* 1-byte ASCII */
-                                    *dst++ = c;
-                                } else { /* 2-byte UTF-8 */
-                                    *dst++ = (u8)(0xC0 | (c >> 6));
-                                    *dst++ = (u8)(0x80 | (c & 0x3F));
-                                }
-                                break;
-                            }
-                            return_err(src - 1, "invalid hex escape");
-                        }
-                        case '\n': src++; break;
-                        case '\r': src++; src += (*src == '\n'); break;
-                        case 0xE2: /* Line terminator: U+2028, U+2029 */
-                            if ((src[1] == 0x80 && src[2] == 0xA8) ||
-                                (src[1] == 0x80 && src[2] == 0xA9)) {
-                                src += 3;
-                            }
-                            break;
-                        default:
-                            break; /* skip */
+        u8 esc = esc_conv_table[*++src];
+        if (likely(esc != 0)) {
+            /* One of ["\\/bfnrt], resolved with a table load: which escape
+               follows is hard to predict, so dispatching on the character
+               costs a mispredicted indirect branch on nearly every escape. */
+            *dst++ = esc;
+            src++;
+        } else if (likely(*src == 'u')) {
+            src--;
+            if (!read_uni_esc(&src, &dst, msg)) return_err(src, *msg);
+        } else if (has_allow(EXT_ESCAPE)) {
+            /* read extended escape (non-standard) */
+            switch (*src) {
+                case '\'': *dst++ = '\''; src++; break;
+                case 'a':  *dst++ = '\a'; src++; break;
+                case 'v':  *dst++ = '\v'; src++; break;
+                case '?':  *dst++ = '\?'; src++; break;
+                case 'e':  *dst++ = 0x1B; src++; break;
+                case '0':
+                    if (!char_is_digit(src[1])) {
+                        *dst++ = '\0'; src++; break;
                     }
-                } else if (quo == '\'' && *src == '\'') {
-                    *dst++ = '\''; src++; break;
-                } else {
-                    return_err(src - 1, "invalid escaped sequence in string");
+                    return_err(src - 1, "octal escape is not allowed");
+                case '1': case '2': case '3': case '4':
+                case '5': case '6': case '7': case '8': case '9':
+                    return_err(src - 1, "invalid number escape");
+                case 'x': {
+                    u8 c;
+                    if (hex_load_2(src + 1, &c)) {
+                        src += 3;
+                        if (c <= 0x7F) { /* 1-byte ASCII */
+                            *dst++ = c;
+                        } else { /* 2-byte UTF-8 */
+                            *dst++ = (u8)(0xC0 | (c >> 6));
+                            *dst++ = (u8)(0x80 | (c & 0x3F));
+                        }
+                        break;
+                    }
+                    return_err(src - 1, "invalid hex escape");
                 }
+                case '\n': src++; break;
+                case '\r': src++; src += (*src == '\n'); break;
+                case 0xE2: /* Line terminator: U+2028, U+2029 */
+                    if ((src[1] == 0x80 && src[2] == 0xA8) ||
+                        (src[1] == 0x80 && src[2] == 0xA9)) {
+                        src += 3;
+                    }
+                    break;
+                default:
+                    break; /* skip */
             }
+        } else if (quo == '\'' && *src == '\'') {
+            *dst++ = '\''; src++;
+        } else {
+            return_err(src - 1, "invalid escaped sequence in string");
         }
     } else if (likely(*src == quo)) {
         val->tag = ((u64)(dst - hdr) << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
