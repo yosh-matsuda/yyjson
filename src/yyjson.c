@@ -1008,6 +1008,51 @@ static_inline bool char_is_digit(u8 d) {
     return !!(char_table3[d] & CHAR_TYPE_DIGIT);
 }
 
+/**
+ Returns whether all four bytes of `v` are decimal digits. `v` is evaluated
+ more than once.
+
+ A byte is a digit if its high nibble is 3 and it is not above '9'. The latter
+ is true when adding 6 does not carry into the high nibble, so both tests fold
+ into a single comparison. A byte large enough to carry into the next one fails
+ its own test, which rejects the whole word anyway, so the order the bytes were
+ loaded in does not matter.
+ */
+#define dec_4_is_digits(v) \
+    ((((v) & 0xF0F0F0F0UL) | \
+      ((((v) + 0x06060606UL) & 0xF0F0F0F0UL) >> 4)) == 0x33333333UL)
+
+/**
+ Returns the position after a run of decimal digits starting at `cur`.
+
+ The first four digits are checked one at a time, so a number that is shorter
+ than that costs exactly what it did before, and only longer runs pay for the
+ word test.
+
+ `padded` tells whether the input is followed by `YYJSON_PADDING_SIZE` bytes,
+ which is what makes reading a word at a time legal: the padding is zeroed, so
+ it is not made of digits and stops the loop at the first padding byte at the
+ latest. `yyjson_read_number()` takes a plain null-terminated string, which
+ carries no such padding.
+ */
+static_inline u8 *skip_digits(u8 *cur, bool padded) {
+    u32 four;
+    if (!char_is_digit(cur[0])) return cur + 0;
+    if (!char_is_digit(cur[1])) return cur + 1;
+    if (!char_is_digit(cur[2])) return cur + 2;
+    if (!char_is_digit(cur[3])) return cur + 3;
+    cur += 4;
+    if (padded) {
+        for (;;) {
+            byte_copy_4(&four, cur);
+            if (!dec_4_is_digits(four)) break;
+            cur += 4;
+        }
+    }
+    while (char_is_digit(*cur)) cur++;
+    return cur;
+}
+
 /** Match an exponent character: [eE]. */
 static_inline bool char_is_exp(u8 d) {
     return !!(char_table3[d] & CHAR_TYPE_EXP);
@@ -3521,7 +3566,8 @@ static_inline bool read_inf_or_nan(u8 **ptr, u8 **pre,
 
 /** Read a JSON number as raw string. */
 static_noinline bool read_num_raw(u8 **ptr, u8 **pre, yyjson_read_flag flg,
-                                  yyjson_val *val, const char **msg) {
+                                  yyjson_val *val, const char **msg,
+                                  bool padded) {
 #define return_err(_pos, _msg) do { \
     *msg = _msg; *end = _pos; return false; \
 } while (false)
@@ -3570,7 +3616,7 @@ static_noinline bool read_num_raw(u8 **ptr, u8 **pre, yyjson_read_flag flg,
             return_raw();
         }
     } else {
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
         if (!char_is_fp(*cur)) return_raw();
     }
 
@@ -3585,7 +3631,7 @@ read_double:
                 return_err(cur, "no digit after decimal point");
             }
         }
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
     }
 
     /* read exponent part */
@@ -3594,7 +3640,7 @@ read_double:
         if (!char_is_digit(*cur++)) {
             return_err(cur, "no digit after exponent sign");
         }
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
     }
 
     return_raw();
@@ -4139,16 +4185,7 @@ static_inline u64 diy_fp_to_ieee_raw(diy_fp fp) {
 static_inline bool read_dec_4(const u8 *ptr, u32 *val) {
     u32 v = ((u32)ptr[0]) | ((u32)ptr[1] << 8) |
             ((u32)ptr[2] << 16) | ((u32)ptr[3] << 24);
-    /*
-     A byte is a digit if its high nibble is 3 and it is not above '9'. The
-     latter is true when adding 6 does not carry into the high nibble, so both
-     tests fold into a single comparison. A byte large enough to carry into the
-     next one fails its own test, which rejects the whole word anyway.
-     */
-    if (((v & 0xF0F0F0F0UL) |
-         (((v + 0x06060606UL) & 0xF0F0F0F0UL) >> 4)) != 0x33333333UL) {
-        return false;
-    }
+    if (!dec_4_is_digits(v)) return false;
     /*
      Fold the four digits pairwise: each multiply shifts one digit of a pair
      onto the other and adds them, which leaves the pair value in a single
@@ -4235,7 +4272,7 @@ static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
 
     /* read number as raw string if has `YYJSON_READ_NUMBER_AS_RAW` flag */
     if (has_flg(NUMBER_AS_RAW)) {
-        return read_num_raw(ptr, pre, flg, val, msg);
+        return read_num_raw(ptr, pre, flg, val, msg, padded);
     }
 
     sign = (*hdr == '-');
@@ -4889,7 +4926,7 @@ static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
 
     /* read number as raw string if has `YYJSON_READ_NUMBER_AS_RAW` flag */
     if (has_flg(NUMBER_AS_RAW)) {
-        return read_num_raw(ptr, pre, flg, val, msg);
+        return read_num_raw(ptr, pre, flg, val, msg, padded);
     }
 
     sign = (*hdr == '-');
