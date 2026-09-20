@@ -992,6 +992,51 @@ static_inline bool char_is_digit(u8 d) {
     return !!(char_table3[d] & CHAR_TYPE_DIGIT);
 }
 
+/**
+ Returns whether all four bytes of `v` are decimal digits. `v` is evaluated
+ more than once.
+
+ A byte is a digit if its high nibble is 3 and it is not above '9'. The latter
+ is true when adding 6 does not carry into the high nibble, so both tests fold
+ into a single comparison. A byte large enough to carry into the next one fails
+ its own test, which rejects the whole word anyway, so the order the bytes were
+ loaded in does not matter.
+ */
+#define dec_4_is_digits(v) \
+    ((((v) & 0xF0F0F0F0UL) | \
+      ((((v) + 0x06060606UL) & 0xF0F0F0F0UL) >> 4)) == 0x33333333UL)
+
+/**
+ Returns the position after a run of decimal digits starting at `cur`.
+
+ The first four digits are checked one at a time, so a number that is shorter
+ than that costs exactly what it did before, and only longer runs pay for the
+ word test.
+
+ `padded` tells whether the input is followed by `YYJSON_PADDING_SIZE` bytes,
+ which is what makes reading a word at a time legal: the padding is zeroed, so
+ it is not made of digits and stops the loop at the first padding byte at the
+ latest. `yyjson_read_number()` takes a plain null-terminated string, which
+ carries no such padding.
+ */
+static_inline u8 *skip_digits(u8 *cur, bool padded) {
+    u32 four;
+    if (!char_is_digit(cur[0])) return cur + 0;
+    if (!char_is_digit(cur[1])) return cur + 1;
+    if (!char_is_digit(cur[2])) return cur + 2;
+    if (!char_is_digit(cur[3])) return cur + 3;
+    cur += 4;
+    if (padded) {
+        for (;;) {
+            byte_copy_4(&four, cur);
+            if (!dec_4_is_digits(four)) break;
+            cur += 4;
+        }
+    }
+    while (char_is_digit(*cur)) cur++;
+    return cur;
+}
+
 /** Match an exponent character: [eE]. */
 static_inline bool char_is_exp(u8 d) {
     return !!(char_table3[d] & CHAR_TYPE_EXP);
@@ -3463,7 +3508,8 @@ static_inline bool read_inf_or_nan(u8 **ptr, u8 **pre,
 
 /** Read a JSON number as raw string. */
 static_noinline bool read_num_raw(u8 **ptr, u8 **pre, yyjson_read_flag flg,
-                                  yyjson_val *val, const char **msg) {
+                                  yyjson_val *val, const char **msg,
+                                  bool padded) {
 #define return_err(_pos, _msg) do { \
     *msg = _msg; *end = _pos; return false; \
 } while (false)
@@ -3512,7 +3558,7 @@ static_noinline bool read_num_raw(u8 **ptr, u8 **pre, yyjson_read_flag flg,
             return_raw();
         }
     } else {
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
         if (!char_is_fp(*cur)) return_raw();
     }
 
@@ -3527,7 +3573,7 @@ read_double:
                 return_err(cur, "no digit after decimal point");
             }
         }
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
     }
 
     /* read exponent part */
@@ -3536,7 +3582,7 @@ read_double:
         if (!char_is_digit(*cur++)) {
             return_err(cur, "no digit after exponent sign");
         }
-        while (char_is_digit(*cur)) cur++;
+        cur = skip_digits(cur, padded);
     }
 
     return_raw();
@@ -4058,6 +4104,42 @@ static_inline u64 diy_fp_to_ieee_raw(diy_fp fp) {
  *============================================================================*/
 
 /**
+ The number of significant digits a number must have before the reader
+ switches from reading one digit at a time to reading four at a time.
+
+ It may not exceed `U64_SAFE_DIG - 4`, because the first four digits are
+ added to the significand before the digit budget is tested again, nor 18,
+ which is the last position the unrolled reader defines a label for.
+ */
+#define DEC_4_MIN_DIG 8
+
+/**
+ Reads four consecutive decimal digits at `ptr` and stores their value in
+ `val`. Returns false if the four bytes are not all digits, leaving `val`
+ unchanged.
+
+ The bytes are always combined in little-endian order, so the digit read at
+ `ptr` ends up in the lowest byte on any host and a single load is emitted.
+
+ Four bytes may only be read when the input is followed by
+ `YYJSON_PADDING_SIZE` bytes, which is why the callers test `padded` first.
+ */
+static_inline bool read_dec_4(const u8 *ptr, u32 *val) {
+    u32 v = ((u32)ptr[0]) | ((u32)ptr[1] << 8) |
+            ((u32)ptr[2] << 16) | ((u32)ptr[3] << 24);
+    if (!dec_4_is_digits(v)) return false;
+    /*
+     Fold the four digits pairwise: each multiply shifts one digit of a pair
+     onto the other and adds them, which leaves the pair value in a single
+     byte, then the two pairs in a single half-word.
+     */
+    v &= 0x0F0F0F0FUL;
+    v = (u32)(v * 2561UL) >> 8;
+    *val = (u32)((v & 0x00FF00FFUL) * 6553601UL) >> 16;
+    return true;
+}
+
+/**
  Read a JSON number.
 
  1. This function assume that the floating-point number is in IEEE-754 format.
@@ -4067,7 +4149,7 @@ static_inline u64 diy_fp_to_ieee_raw(diy_fp fp) {
  3. This function (with inline attribute) may generate a lot of instructions.
  */
 static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
-                            yyjson_val *val, const char **msg) {
+                            yyjson_val *val, const char **msg, bool padded) {
 #define return_err(_pos, _msg) do { \
     *msg = _msg; \
     *end = _pos; \
@@ -4122,6 +4204,7 @@ static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
     i64 exp_sig = 0; /* temporary exponent number from significant part */
     i64 exp_lit = 0; /* temporary exponent number from exponent literal part */
     u64 num; /* temporary number for reading */
+    u32 num4; /* temporary four-digit number for reading */
     u8 *tmp; /* temporary cursor for reading */
 
     u8 *hdr = *ptr;
@@ -4131,7 +4214,7 @@ static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
 
     /* read number as raw string if has `YYJSON_READ_NUMBER_AS_RAW` flag */
     if (has_flg(NUMBER_AS_RAW)) {
-        return read_num_raw(ptr, pre, flg, val, msg);
+        return read_num_raw(ptr, pre, flg, val, msg, padded);
     }
 
     sign = (*hdr == '-');
@@ -4240,6 +4323,9 @@ leading_dot:
     /* read fraction part */
 #define expr_frac(i) \
     digi_frac_##i: \
+    if ((i) == DEC_4_MIN_DIG && padded && read_dec_4(cur + (i) + 1, &num4)) { \
+        num = (i); goto digi_frac_read; \
+    } \
     if (likely((num = (u64)(cur[i + 1] - (u8)'0')) <= 9)) \
         sig = num + sig * 10; \
     else { goto digi_stop_##i; }
@@ -4258,6 +4344,33 @@ leading_dot:
     goto digi_frac_end;
     repeat_in_1_18(expr_stop)
 #undef expr_stop
+
+
+    /*
+     Read the rest of a long fraction part, same as the unrolled code above.
+     Entered with `num4` holding the next four digits, `num` the digit count
+     already in `sig`, and `cur + num + 1` the first of those four digits.
+
+     Reading four digits at a time shortens the dependency chain of four
+     multiply-adds to a single one, and replaces four unpredictable branches
+     with a single test. The hand-off sits inside the unrolled code rather
+     than at its entry, so that only numbers long enough to profit from it
+     ever reach the test.
+     */
+digi_frac_read:
+    cur += num + 1;
+    do {
+        sig = sig * 10000 + num4;
+        cur += 4;
+        num += 4;
+    } while (num <= U64_SAFE_DIG - 4 && read_dec_4(cur, &num4));
+    while (num < U64_SAFE_DIG && char_is_digit(*cur)) {
+        sig = sig * 10 + (u64)(*cur - '0');
+        cur++;
+        num++;
+    }
+    if (likely(!char_is_digit(*cur))) goto digi_frac_end; /* fraction end */
+    goto digi_frac_more; /* read more digits in fraction part */
 
 
     /* read more digits in integral part */
@@ -4702,7 +4815,7 @@ digi_finish:
  This function use libc's strtod() to read floating-point number.
  */
 static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
-                            yyjson_val *val, const char **msg) {
+                            yyjson_val *val, const char **msg, bool padded) {
 #define return_err(_pos, _msg) do { \
     *msg = _msg; \
     *end = _pos; \
@@ -4755,7 +4868,7 @@ static_inline bool read_num(u8 **ptr, u8 **pre, yyjson_read_flag flg,
 
     /* read number as raw string if has `YYJSON_READ_NUMBER_AS_RAW` flag */
     if (has_flg(NUMBER_AS_RAW)) {
-        return read_num_raw(ptr, pre, flg, val, msg);
+        return read_num_raw(ptr, pre, flg, val, msg, padded);
     }
 
     sign = (*hdr == '-');
@@ -5593,7 +5706,7 @@ static_noinline yyjson_doc *read_root_single(u8 *hdr, u8 *cur, u8 *eof,
     val = val_hdr + hdr_len;
 
     if (char_is_num(*cur)) {
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto doc_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto doc_end;
         goto fail_number;
     }
     if (*cur == '"') {
@@ -5775,7 +5888,7 @@ arr_val_begin:
     if (char_is_num(*cur)) {
         val_incr();
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto arr_val_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto arr_val_end;
         goto fail_number;
     }
     if (*cur == '"') {
@@ -5953,7 +6066,7 @@ obj_val_begin:
     if (char_is_num(*cur)) {
         val++;
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto obj_val_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto obj_val_end;
         goto fail_number;
     }
     if (*cur == '{') {
@@ -6217,7 +6330,7 @@ arr_val_begin:
     if (char_is_num(*cur)) {
         val_incr();
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto arr_val_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto arr_val_end;
         goto fail_number;
     }
     if (*cur == '"') {
@@ -6417,7 +6530,7 @@ obj_val_begin:
     if (char_is_num(*cur)) {
         val++;
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto obj_val_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto obj_val_end;
         goto fail_number;
     }
     if (*cur == '{') {
@@ -6834,7 +6947,7 @@ const char *yyjson_read_number(const char *dat,
 #endif
 
 #if YYJSON_DISABLE_FAST_FP_CONV
-    if (!read_num(&cur, pre, flg, val, &msg)) {
+    if (!read_num(&cur, pre, flg, val, &msg, false)) {
         if (dat_len >= sizeof(buf)) alc->free(alc->ctx, hdr);
         return_err(cur, INVALID_NUMBER, msg);
     }
@@ -6842,7 +6955,7 @@ const char *yyjson_read_number(const char *dat,
     if (yyjson_is_raw(val)) val->uni.str = dat;
     return dat + (cur - hdr);
 #else
-    if (!read_num(&cur, pre, flg, val, &msg)) {
+    if (!read_num(&cur, pre, flg, val, &msg, false)) {
         return_err(cur, INVALID_NUMBER, msg);
     }
     return (const char *)cur;
@@ -7132,7 +7245,7 @@ doc_begin:
         goto arr_val_begin;
     }
     if (char_is_num(*cur)) {
-        if (likely(read_num(&cur, pre, flg, val, &msg))) {
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) {
             /* a root number may continue with more digits in a later chunk */
             if (unlikely(len < state->buf_len)) check_maybe_truncated_number();
             goto doc_end;
@@ -7200,7 +7313,7 @@ arr_val_continue:
     if (char_is_num(*cur)) {
         val_incr();
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto arr_val_maybe_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto arr_val_maybe_end;
         goto fail_number;
     }
     if (*cur == '"') {
@@ -7347,7 +7460,7 @@ obj_val_continue:
     if (char_is_num(*cur)) {
         val++;
         ctn_len++;
-        if (likely(read_num(&cur, pre, flg, val, &msg))) goto obj_val_maybe_end;
+        if (likely(read_num(&cur, pre, flg, val, &msg, true))) goto obj_val_maybe_end;
         goto fail_number;
     }
     if (*cur == '{') {
