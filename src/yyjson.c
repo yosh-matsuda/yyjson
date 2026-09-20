@@ -923,6 +923,26 @@ static_inline bool char_is_space(u8 c) {
     return !!(char_table1[c] & CHAR_TYPE_SPACE);
 }
 
+/**
+ Returns the position after a run of whitespace starting at `cur`.
+
+ Indentation is a run of spaces, so four of them are matched with a single
+ comparison, which is endian independent since all four bytes are equal. Four
+ bytes may always be read here: the buffer is followed by `YYJSON_PADDING_SIZE`
+ zeroed bytes, which are not spaces, so the loop stops at the first padding
+ byte at the latest and never reads beyond the padding.
+ */
+static_noinline u8 *skip_spaces(u8 *cur) {
+    u32 four;
+    for (;;) {
+        byte_copy_4(&four, cur);
+        if (four != 0x20202020UL) break;
+        cur += 4;
+    }
+    while (char_is_space(*cur)) cur++;
+    return cur;
+}
+
 /** Match an extended whitespace: [ \t\n\r\\v\\f], JSON5 whitespace. */
 static_inline bool char_is_space_ext(u8 c) {
     return !!(char_table1[c] & CHAR_TYPE_SPACE_EXT);
@@ -5661,7 +5681,7 @@ static_noinline yyjson_doc *read_root_single(u8 *hdr, u8 *cur, u8 *eof,
 doc_end:
     /* check invalid contents after json document */
     if (unlikely(cur < eof) && !has_flg(STOP_WHEN_DONE)) {
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
             if (!skip_trivia(&cur, eof, flg) && cur == eof) {
                 goto fail_comment;
@@ -6082,7 +6102,7 @@ obj_end:
 doc_end:
     /* check invalid contents after json document */
     if (unlikely(cur < eof) && !has_flg(STOP_WHEN_DONE)) {
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
             if (!skip_trivia(&cur, eof, flg) && cur == eof) {
                 goto fail_comment;
@@ -6289,7 +6309,7 @@ arr_val_begin:
         goto fail_trailing_comma;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto arr_val_begin;
     }
     if (has_allow(INF_AND_NAN) &&
@@ -6325,7 +6345,7 @@ arr_val_end:
         goto arr_end;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto arr_val_end;
     }
     if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
@@ -6401,7 +6421,7 @@ obj_key_begin:
         goto fail_trailing_comma;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_key_begin;
     }
     if (has_allow(SINGLE_QUOTED_STR) && *cur == '\'') {
@@ -6432,7 +6452,7 @@ obj_key_end:
         goto obj_val_begin;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_key_end;
     }
     if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
@@ -6484,7 +6504,7 @@ obj_val_begin:
         goto fail_literal_null;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_val_begin;
     }
     if (has_allow(INF_AND_NAN) &&
@@ -6520,7 +6540,7 @@ obj_val_end:
         goto obj_end;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_val_end;
     }
     if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
@@ -6552,7 +6572,7 @@ obj_end:
 doc_end:
     /* check invalid contents after json document */
     if (unlikely(cur < eof) && !has_flg(STOP_WHEN_DONE)) {
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
             if (!skip_trivia(&cur, eof, flg) && cur == eof) {
                 goto fail_comment;
@@ -6643,7 +6663,7 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
 
     /* skip empty contents before json document */
     if (unlikely(!char_is_ctn(*cur))) {
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (unlikely(!char_is_ctn(*cur))) {
             if (has_allow(TRIVIA) && char_is_trivia(*cur)) {
                 if (!skip_trivia(&cur, eof, flg) && cur == eof) {
@@ -7124,7 +7144,7 @@ yyjson_doc *yyjson_incr_read(yyjson_incr_state *state, size_t len,
 doc_begin:
     /* skip empty contents before json document */
     if (unlikely(!char_is_ctn(*cur))) {
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (unlikely(cur >= end)) goto unexpected_end; /* input data is empty */
     }
 
@@ -7269,7 +7289,7 @@ arr_val_continue:
         goto fail_trailing_comma;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto arr_val_continue;
     }
     goto fail_character_val;
@@ -7290,7 +7310,7 @@ arr_val_end:
         goto arr_end;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto arr_val_end;
     }
     goto fail_character_arr_end;
@@ -7351,7 +7371,7 @@ obj_key_continue:
         goto fail_trailing_comma;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_key_continue;
     }
     goto fail_character_obj_key;
@@ -7363,7 +7383,7 @@ obj_key_end:
         goto obj_val_begin;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_key_end;
     }
     goto fail_character_obj_sep;
@@ -7411,7 +7431,7 @@ obj_val_continue:
         goto fail_literal_null;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_val_continue;
     }
     goto fail_character_val;
@@ -7432,7 +7452,7 @@ obj_val_end:
         goto obj_end;
     }
     if (char_is_space(*cur)) {
-        while (char_is_space(*++cur));
+        cur = skip_spaces(cur + 1);
         goto obj_val_end;
     }
     goto fail_character_obj_end;
@@ -7461,7 +7481,7 @@ doc_end:
     if (unlikely(cur < end || len < state->buf_len) &&
         !has_flg(STOP_WHEN_DONE)) {
         save_incr_state(doc_end);
-        while (char_is_space(*cur)) cur++;
+        cur = skip_spaces(cur);
         if (unlikely(cur < end)) goto fail_garbage;
         /* the document is complete for the bytes seen so far, but more input
            is still pending; it may hold trailing content that has to be
