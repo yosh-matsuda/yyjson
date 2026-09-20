@@ -8771,6 +8771,10 @@ typedef u8 char_enc_type;
 #define CHAR_ENC_CPY_4  8 /* 4-byte UTF-8, copy. */
 #define CHAR_ENC_ESC_4  9 /* 4-byte UTF-8, escaped as '\uXXXX\uXXXX'. */
 
+/* The SIMD stop set of the string writer must match the non-zero entries of
+   these tables, or it would copy a byte through unescaped. See
+   enc_copy_chunks(). */
+
 /** Character encode type table: don't escape unicode, don't escape '/'.
     (generated with misc/make_tables.c) */
 static const char_enc_type enc_table_cpy[256] = {
@@ -9123,6 +9127,138 @@ static_inline u8 *write_str_noesc(u8 *cur, const u8 *str, usize str_len) {
     return cur;
 }
 
+#if YYJSON_HAS_SIMD_SSE2
+
+/** A pair of read/write positions used by the string writer. */
+typedef struct { const u8 *src; u8 *dst; } enc_pos_pair;
+
+/** SIMD chunk size used by the string writer. */
+#if YYJSON_HAS_SIMD_AVX2
+#   define ENC_CHUNK_SIZE 32
+#else
+#   define ENC_CHUNK_SIZE 16
+#endif
+
+/**
+ Returns a bitmask of bytes that end a copyable ASCII run in the string writer:
+ a control character, a non-ASCII byte, the quote, the backslash, and the slash
+ if it is escaped. This is exactly the set of bytes with a non-zero entry in
+ `enc_table`, for all four tables: they differ only in the slash entry and in
+ the encode type (not the zero/non-zero state) of the non-ASCII bytes.
+ Bytes >= 0x80 are negative as signed, so a single signed compare covers both
+ control characters and non-ASCII bytes. The SSE2 variant takes the slash as
+ an argument and is given the quote instead when slashes are not escaped, so
+ that one compare serves both cases without a second copy of the loop.
+ */
+#if YYJSON_HAS_SIMD_AVX2
+/** Returns the shuffle table used by enc_stop_mask_avx2(). */
+static_inline __m256i enc_stop_table_avx2(bool esc_slash) {
+    /*
+     The quote, the backslash and the slash are matched with a byte shuffle
+     instead of three compares: indexing the table with a byte yields that byte
+     again only for 0x22, 0x5C and 0x2F, since every other entry has a
+     different low nibble. The zero entries can only match a null byte, which
+     stops the run anyway, and a byte >= 0x80 shuffles in a zero and is caught
+     by the signed compare. See also str_stop_mask_avx2().
+
+     The two variants are kept as constant data and selected with an index, so
+     that setting the table up costs a single load instead of the instruction
+     sequence a vector built from a runtime value would need.
+     */
+    static const u8 tables[2][32] = {
+        { 0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, 0,
+          0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, 0 },
+        { 0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, '/',
+          0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, '\\', 0, 0, '/' }
+    };
+    return _mm256_loadu_si256(
+        (const __m256i *)(const void *)tables[esc_slash]);
+}
+
+static_inline u32 enc_stop_mask_avx2(__m256i chunk, __m256i table) {
+    __m256i limit = _mm256_set1_epi8(0x20);
+    __m256i esc_char = _mm256_cmpeq_epi8(chunk,
+                                         _mm256_shuffle_epi8(table, chunk));
+    __m256i ctrl_or_non_ascii = _mm256_cmpgt_epi8(limit, chunk);
+    return (u32)_mm256_movemask_epi8(
+        _mm256_or_si256(esc_char, ctrl_or_non_ascii));
+}
+#else
+static_inline u32 enc_stop_mask_sse2(__m128i chunk, __m128i extra) {
+    __m128i quote = _mm_set1_epi8('"');
+    __m128i slash = _mm_set1_epi8('\\');
+    __m128i limit = _mm_set1_epi8(0x20);
+    __m128i quote_mask = _mm_cmpeq_epi8(chunk, quote);
+    __m128i slash_mask = _mm_cmpeq_epi8(chunk, slash);
+    __m128i extra_mask = _mm_cmpeq_epi8(chunk, extra);
+    __m128i ctrl_or_non_ascii = _mm_cmplt_epi8(chunk, limit);
+    return (u32)_mm_movemask_epi8(_mm_or_si128(
+        _mm_or_si128(quote_mask, slash_mask),
+        _mm_or_si128(extra_mask, ctrl_or_non_ascii)));
+}
+#endif
+
+/**
+ Copies whole SIMD chunks of a string that need no escaping and returns the
+ position of the first byte that does (or the position where fewer than one
+ chunk is left).
+
+ Unlike the reader, the writer must not read past the end of the input string,
+ since the caller's buffer has no padding, so only full chunks are loaded.
+ The store, on the other hand, may always write a whole chunk: the output
+ buffer is sized for `str_len * 6 + 2` bytes and each consumed input byte
+ produces at most 6 output bytes, so at least `6 * (end - src) + 1` bytes are
+ still available, which exceeds the chunk size whenever a chunk is loaded.
+ Storing unconditionally keeps the loop at a single branch, and the exact stop
+ position is then cheap to derive because the bytes are already in place.
+ */
+static_inline enc_pos_pair enc_copy_chunks(const u8 *src, u8 *dst,
+                                           const u8 *end, bool esc_slash) {
+    enc_pos_pair pos;
+#if YYJSON_HAS_SIMD_AVX2
+    if (end - src >= ENC_CHUNK_SIZE) {
+        __m256i table = enc_stop_table_avx2(esc_slash);
+        do {
+            __m256i chunk =
+                _mm256_loadu_si256((const __m256i *)(const void *)src);
+            u32 mask = enc_stop_mask_avx2(chunk, table);
+            _mm256_storeu_si256((__m256i *)(void *)dst, chunk);
+            if (mask) {
+                u32 cnt = u64_tz_bits(mask);
+                src += cnt;
+                dst += cnt;
+                break;
+            }
+            src += ENC_CHUNK_SIZE;
+            dst += ENC_CHUNK_SIZE;
+        } while (end - src >= ENC_CHUNK_SIZE);
+    }
+#else
+    if (end - src >= ENC_CHUNK_SIZE) {
+        __m128i extra = _mm_set1_epi8(esc_slash ? '/' : '"');
+        do {
+            __m128i chunk =
+                _mm_loadu_si128((const __m128i *)(const void *)src);
+            u32 mask = enc_stop_mask_sse2(chunk, extra);
+            _mm_storeu_si128((__m128i *)(void *)dst, chunk);
+            if (mask) {
+                u32 cnt = u64_tz_bits(mask);
+                src += cnt;
+                dst += cnt;
+                break;
+            }
+            src += ENC_CHUNK_SIZE;
+            dst += ENC_CHUNK_SIZE;
+        } while (end - src >= ENC_CHUNK_SIZE);
+    }
+#endif
+    pos.src = src;
+    pos.dst = dst;
+    return pos;
+}
+
+#endif
+
 /**
  Write UTF-8 string (requires len * 6 + 2 bytes buffer).
  @param cur Buffer cursor.
@@ -9167,6 +9303,16 @@ copy_ascii:
         repeat16_incr(expr_jump)
         byte_copy_16(cur, src);
         cur += 16; src += 16;
+#if YYJSON_HAS_SIMD_SSE2
+        /*
+         Only strings that already passed the unrolled round above reach the
+         chunk copy, so text that escapes or leaves ASCII every few bytes
+         never pays for the chunk setup. The copy itself is kept out of this
+         loop so that its code does not compete with the unrolled round for
+         the instruction fetch window. See enc_copy_chunks().
+         */
+        if (end - src >= (ptrdiff_t)ENC_CHUNK_SIZE) goto copy_chunks;
+#endif
     }
 
     while (end - src >= 4) {
@@ -9187,6 +9333,22 @@ copy_ascii:
 
 #undef expr_jump
 #undef expr_stop
+
+#if YYJSON_HAS_SIMD_SSE2
+copy_chunks:
+    /*
+     On return `src` either points at a byte that the table marks, which the
+     unrolled round resolves with a single lookup, or at the last bytes of the
+     string.
+     */
+    {
+        enc_pos_pair pos = enc_copy_chunks(src, cur, end,
+                                           enc_table[(u8)'/'] != 0);
+        src = pos.src;
+        cur = pos.dst;
+    }
+    goto copy_ascii;
+#endif
 
 copy_utf8:
     if (unlikely(src + 4 > end)) {
