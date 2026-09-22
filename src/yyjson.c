@@ -9379,9 +9379,20 @@ static_inline u32 enc_stop_mask_sse2(__m128i chunk, __m128i extra) {
  still available, which exceeds the chunk size whenever a chunk is loaded.
  Storing unconditionally keeps the loop at a single branch, and the exact stop
  position is then cheap to derive because the bytes are already in place.
+
+ GCC reads static_inline as always_inline and would paste both instruction set
+ variants into the already large writer, so only GCC is asked to keep it out
+ of line; Clang makes the better choice by itself.
  */
-static_inline enc_pos_pair enc_copy_chunks(const u8 *src, u8 *dst,
-                                           const u8 *end, bool esc_slash) {
+#if YYJSON_IS_REAL_GCC
+#   define enc_copy_chunks_linkage static_noinline
+#else
+#   define enc_copy_chunks_linkage static_inline
+#endif
+
+enc_copy_chunks_linkage enc_pos_pair enc_copy_chunks(const u8 *src, u8 *dst,
+                                                     const u8 *end,
+                                                     bool esc_slash) {
     enc_pos_pair pos;
 #if YYJSON_HAS_SIMD_AVX2
     if (end - src >= ENC_CHUNK_SIZE) {
@@ -9424,6 +9435,8 @@ static_inline enc_pos_pair enc_copy_chunks(const u8 *src, u8 *dst,
     pos.dst = dst;
     return pos;
 }
+
+#undef enc_copy_chunks_linkage
 
 #endif
 
