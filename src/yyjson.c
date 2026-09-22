@@ -10515,11 +10515,24 @@ fail_depth: return_err(DEPTH, MSG_DEPTH);
 #undef check_str_len
 }
 
-static char *write_root(const yyjson_val *val,
-                        yyjson_write_flag flg,
-                        const yyjson_alc *alc_ptr,
-                        char *buf, usize *dat_len,
-                        yyjson_write_err *err) {
+/*
+ With link-time optimization or a unity build, the caller's constant write
+ flags let the optimizer specialize write_root(). The clone is smaller but
+ slower, because its branch layout leaves the hot path jumping instead of
+ falling through, so the flags are kept out of interprocedural analysis where
+ the compiler allows it. The mutable writer profits from the propagation.
+ */
+#if yyjson_has_attribute(noipa)
+#   define write_root_noipa __attribute__((noipa))
+#else
+#   define write_root_noipa
+#endif
+
+static write_root_noipa char *write_root(const yyjson_val *val,
+                                         yyjson_write_flag flg,
+                                         const yyjson_alc *alc_ptr,
+                                         char *buf, usize *dat_len,
+                                         yyjson_write_err *err) {
     yyjson_write_err tmp_err;
     usize tmp_dat_len;
     yyjson_alc alc = alc_ptr ? *alc_ptr : YYJSON_DEFAULT_ALC;
@@ -10543,6 +10556,8 @@ static char *write_root(const yyjson_val *val,
         return (char *)write_root_minify(root, flg, alc, buf, dat_len, err);
     }
 }
+
+#undef write_root_noipa
 
 
 
