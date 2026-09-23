@@ -6212,11 +6212,22 @@ fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
 #undef return_err
 }
 
+/*
+ Keep the pretty reader out of line on GCC, so that the two readers do not
+ share one register allocation and changes to one do not perturb the other.
+ Clang loses on some minified inputs with the same split, so it is kept inline.
+ */
+#if YYJSON_IS_REAL_GCC
+#define read_root_pretty_attr static_noinline
+#else
+#define read_root_pretty_attr static_inline
+#endif
+
 /** Read JSON document (accept all style, but optimized for pretty). */
-static_inline yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
-                                           yyjson_alc alc,
-                                           yyjson_read_flag flg,
-                                           yyjson_read_err *err) {
+read_root_pretty_attr yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
+                                                   yyjson_alc alc,
+                                                   yyjson_read_flag flg,
+                                                   yyjson_read_err *err) {
 #define return_err(_pos, _code, _msg) do { \
     if (is_truncated_end(hdr, _pos, eof, YYJSON_READ_ERROR_##_code, flg)) { \
         err->pos = (usize)(eof - hdr); \
@@ -6682,6 +6693,7 @@ fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
 #undef return_err
 }
 
+#undef read_root_pretty_attr
 
 
 /*==============================================================================
