@@ -2549,12 +2549,55 @@ static const yyjson_alc YYJSON_DEFAULT_ALC = {
 
 #else /* YYJSON_FREESTANDING */
 
+/*
+ glibc serves a block of 32 MiB or more with a mapping of its own and returns
+ it to the kernel when freed, so each new block faults in page by page. Other
+ libcs may place a large block next to other allocations and are left alone.
+ See YYJSON_DISABLE_HUGE_PAGES.
+ */
+#if !YYJSON_DISABLE_HUGE_PAGES && defined(__linux__) && defined(__GLIBC__) && \
+    yyjson_has_include(<sys/mman.h>) && yyjson_has_include(<unistd.h>)
+#include <sys/mman.h>
+#include <unistd.h>
+#if defined(MADV_HUGEPAGE)
+#define YYJSON_HUGE_PAGE_ADVICE 1
+#endif
+#endif
+
+#if defined(YYJSON_HUGE_PAGE_ADVICE)
+#define HUGE_PAGE_MIN_BLOCK ((usize)32 << 20)
+
+static void huge_page_advise(void *ptr, usize size) {
+    /* Advise the whole mapping: advising a part would split it, and `mremap`
+       then fails and turns every `realloc` of the block into a copy. */
+    long page = sysconf(_SC_PAGESIZE);
+    usize mask, beg, end;
+    if (page <= 0) return;
+    mask = (usize)page - 1;
+    beg = (usize)ptr & ~mask;
+    end = ((usize)ptr + size + mask) & ~mask;
+    madvise((void *)beg, end - beg, MADV_HUGEPAGE);
+}
+#endif
+
 /* default libc allocator */
 static void *default_malloc(void *ctx, usize size) {
+#if defined(YYJSON_HUGE_PAGE_ADVICE)
+    void *ptr = malloc(size);
+    if (ptr && size >= HUGE_PAGE_MIN_BLOCK) huge_page_advise(ptr, size);
+    return ptr;
+#else
     return malloc(size);
+#endif
 }
 static void *default_realloc(void *ctx, void *ptr, usize old_size, usize size) {
+#if defined(YYJSON_HUGE_PAGE_ADVICE)
+    ptr = realloc(ptr, size);
+    if (ptr && size >= HUGE_PAGE_MIN_BLOCK) huge_page_advise(ptr, size);
+    return ptr;
+#else
     return realloc(ptr, size);
+#endif
 }
 static void default_free(void *ctx, void *ptr) {
     free(ptr);

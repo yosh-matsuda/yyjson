@@ -136,6 +136,7 @@ jobs:
           - no_incr
           - no_unalign
           - no_simd
+          - no_huge_pages
           - avx2
           - depth_limit
 
@@ -176,6 +177,9 @@ jobs:
         fi
         if [ "${{matrix.opt}}" == "no_simd" ]; then
           BUILD_OPTIONS="${BUILD_OPTIONS} -DYYJSON_DISABLE_SIMD=ON"
+        fi
+        if [ "${{matrix.opt}}" == "no_huge_pages" ]; then
+          BUILD_OPTIONS="${BUILD_OPTIONS} -DYYJSON_DISABLE_HUGE_PAGES=ON"
         fi
         if [ "${{matrix.opt}}" == "avx2" ]; then
           BUILD_OPTIONS="${BUILD_OPTIONS} -DCMAKE_C_FLAGS=-march=x86-64-v3"
