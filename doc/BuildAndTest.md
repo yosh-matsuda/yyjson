@@ -74,6 +74,7 @@ Supported CMake options (default OFF):
 - `-DYYJSON_DISABLE_UTF8_VALIDATION=ON` Disable UTF-8 validation at compile-time.
 - `-DYYJSON_DISABLE_UNALIGNED_MEMORY_ACCESS=ON` Disable unaligned memory access support at compile-time.
 - `-DYYJSON_DISABLE_SIMD=ON` Disable SIMD optimizations at compile-time.
+- `-DYYJSON_DISABLE_HUGE_PAGES=ON` Disable huge page advice for large blocks of the default allocator.
 - `-DYYJSON_FREESTANDING=ON` Build without libc (see `YYJSON_FREESTANDING` below).
 - `-DYYJSON_READER_DEPTH_LIMIT=<n>` Set a maximum nesting depth for JSON reader (see `YYJSON_READER_DEPTH_LIMIT` below).
 - `-DYYJSON_WRITER_DEPTH_LIMIT=<n>` Set a maximum nesting depth for JSON writer (see `YYJSON_WRITER_DEPTH_LIMIT` below).
@@ -310,6 +311,11 @@ Note: If this flag is enabled while passing illegal UTF-8 strings, the following
 Define as 1 to disable SIMD optimizations at compile-time.<br/>
 By default, SIMD paths are enabled only when supported by the target compiler and architecture.<br/>
 It is recommended when reproducible scalar code generation is required.
+
+## YYJSON_DISABLE_HUGE_PAGES
+Define as 1 to stop the default allocator from advising transparent huge pages for large blocks.<br/>
+By default, when built against glibc on Linux, the default allocator calls `madvise(MADV_HUGEPAGE)` on every block of 32 MiB or more. glibc serves such a block with a mapping of its own and returns it to the kernel when it is freed, so reading a large document with the default allocator otherwise faults its memory in again, 4 KiB at a time, on every read. The advice lets the kernel use 2 MiB pages instead, which cuts the number of page faults by up to 512 times when transparent huge pages are in `madvise` mode, the default of several distributions; in `always` mode the kernel uses them without being asked.<br/>
+The advice never changes the contents of memory, but huge pages may round the resident memory of each block up to the next 2 MiB, and the kernel may compact memory to find them. The advice needs `madvise` to be declared, which strict ISO C modes such as `-std=c11` hide, and has no effect with other libcs or on other platforms, nor for custom allocators or `yyjson_alc_pool_init()`.
 
 ## YYJSON_FREESTANDING
 Define as 1 to build yyjson without libc (`stdlib.h`, `string.h`, `math.h`, and `stdio.h`).
