@@ -6212,22 +6212,38 @@ fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
 #undef return_err
 }
 
-/*
- Keep the pretty reader out of line on GCC, so that the two readers do not
- share one register allocation and changes to one do not perturb the other.
- Clang loses on some minified inputs with the same split, so it is kept inline.
+#if YYJSON_HAS_SIMD_SSE2
+/**
+ Returns whether `cur` starts with exactly `ind` spaces, that is `ind` spaces
+ followed by another character. Reads 32 bytes, so `ind` must be less than 32
+ to match, and the caller must make sure that the 32 bytes are readable.
  */
-#if YYJSON_IS_REAL_GCC
-#define read_root_pretty_attr static_noinline
+static_inline bool indent_match(const u8 *cur, usize ind) {
+    u32 m;
+#if YYJSON_HAS_SIMD_AVX2
+    __m256i c = _mm256_loadu_si256((const __m256i *)(const void *)cur);
+    m = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, _mm256_set1_epi8(' ')));
 #else
-#define read_root_pretty_attr static_inline
+    __m128i sp = _mm_set1_epi8(' ');
+    __m128i c0 = _mm_loadu_si128((const __m128i *)(const void *)cur);
+    __m128i c1 = _mm_loadu_si128((const __m128i *)(const void *)(cur + 16));
+    m = (u32)_mm_movemask_epi8(_mm_cmpeq_epi8(c0, sp)) |
+        ((u32)_mm_movemask_epi8(_mm_cmpeq_epi8(c1, sp)) << 16);
+#endif
+    return u64_tz_bits(~(u64)m) == ind;
+}
 #endif
 
-/** Read JSON document (accept all style, but optimized for pretty). */
-read_root_pretty_attr yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
-                                                   yyjson_alc alc,
-                                                   yyjson_read_flag flg,
-                                                   yyjson_read_err *err) {
+/**
+ Read JSON document (accept all style, but optimized for pretty).
+
+ Kept out of line, so that it does not share one register allocation with the
+ minified reader and changes to one of them do not perturb the other.
+ */
+static_noinline yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
+                                             yyjson_alc alc,
+                                             yyjson_read_flag flg,
+                                             yyjson_read_err *err) {
 #define return_err(_pos, _code, _msg) do { \
     if (is_truncated_end(hdr, _pos, eof, YYJSON_READ_ERROR_##_code, flg)) { \
         err->pos = (usize)(eof - hdr); \
@@ -6241,6 +6257,46 @@ read_root_pretty_attr yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
     if (val_hdr) alc.free(alc.ctx, val_hdr); \
     return NULL; \
 } while (false)
+
+/*
+ Pretty-printed documents indent each line by the depth of the line times a
+ fixed width, so the indentation that follows a line break is known before it
+ is read. It is checked with a single vector comparison and skipped at once,
+ where the loop below takes one iteration per two spaces and a mispredicted
+ exit whenever the depth changes. Any other layout falls back to the loop.
+ */
+#if YYJSON_HAS_SIMD_SSE2
+#define indent_learn() do { \
+    while (cur[ind_unit] == ' ') ind_unit++; \
+    ind = ind_unit; \
+} while (false)
+#define indent_open() ind += ind_unit
+#define indent_close() ind -= ind_unit
+#define skip_indent(_label) do { \
+    if (likely(eof - cur > 32) && likely(indent_match(cur, ind))) { \
+        cur += ind; \
+        goto _label; \
+    } \
+} while (false)
+#define skip_close_indent(_chr, _label) do { \
+    usize ind_close = ind - ind_unit; \
+    if (*cur == '\n' && likely(eof - cur > 33) && \
+        indent_match(cur + 1, ind_close) && cur[1 + ind_close] == (_chr)) { \
+        cur += 1 + ind_close; \
+        goto _label; \
+    } \
+} while (false)
+#else
+#define indent_learn() do {} while (false)
+#define indent_open() do {} while (false)
+#define indent_close() do {} while (false)
+#define skip_indent(_label) do { \
+    if (false) goto _label; \
+} while (false)
+#define skip_close_indent(_chr, _label) do { \
+    if (false) goto _label; \
+} while (false)
+#endif
 
 #define val_incr() do { \
     val++; \
@@ -6281,6 +6337,10 @@ read_root_pretty_attr yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
 #if YYJSON_READER_DEPTH_LIMIT
     usize ctn_depth = 0; /* current array/object depth */
 #endif
+#if YYJSON_HAS_SIMD_SSE2
+    usize ind_unit = 0; /* indentation width of one level */
+    usize ind; /* expected indentation inside current container */
+#endif
 
     dat_len = has_flg(STOP_WHEN_DONE) ? 256 : (usize)(eof - cur);
     hdr_len = sizeof(yyjson_doc) / sizeof(yyjson_val);
@@ -6300,11 +6360,13 @@ read_root_pretty_attr yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
         ctn->tag = YYJSON_TYPE_OBJ;
         ctn->uni.ofs = 0;
         if (*cur == '\n') cur++;
+        indent_learn();
         goto obj_key_begin;
     } else {
         ctn->tag = YYJSON_TYPE_ARR;
         ctn->uni.ofs = 0;
         if (*cur == '\n') cur++;
+        indent_learn();
         goto arr_val_begin;
     }
 
@@ -6328,7 +6390,11 @@ arr_begin:
     /* push the new array value as current container */
     ctn = val;
     ctn_len = 0;
-    if (*cur == '\n') cur++;
+    indent_open();
+    if (*cur == '\n') {
+        cur++;
+        skip_indent(arr_val_ready);
+    }
 
 arr_val_begin:
 #if YYJSON_IS_REAL_GCC
@@ -6342,6 +6408,7 @@ arr_val_begin:
         else break;
     })
 #endif
+arr_val_ready:
 
     if (*cur == '{') {
         cur++;
@@ -6417,6 +6484,7 @@ arr_val_begin:
 arr_val_end:
     if (byte_match_2(cur, ",\n")) {
         cur += 2;
+        skip_indent(arr_val_ready);
         goto arr_val_begin;
     }
     if (*cur == ',') {
@@ -6424,10 +6492,12 @@ arr_val_end:
         goto arr_val_begin;
     }
     if (*cur == ']') {
+arr_val_end_close:
         cur++;
         goto arr_end;
     }
     if (char_is_space(*cur)) {
+        skip_close_indent(']', arr_val_end_close);
         cur = skip_spaces(cur + 1);
         goto arr_val_end;
     }
@@ -6452,6 +6522,7 @@ arr_end:
     /* pop parent as current container */
     ctn = ctn_parent;
     ctn_len = (usize)(ctn->tag >> YYJSON_TAG_BIT);
+    indent_close();
     if (*cur == '\n') cur++;
     if ((ctn->tag & YYJSON_TYPE_MASK) == YYJSON_TYPE_OBJ) {
         goto obj_val_end;
@@ -6476,7 +6547,11 @@ obj_begin:
     val->uni.ofs = (usize)((u8 *)val - (u8 *)ctn);
     ctn = val;
     ctn_len = 0;
-    if (*cur == '\n') cur++;
+    indent_open();
+    if (*cur == '\n') {
+        cur++;
+        skip_indent(obj_key_ready);
+    }
 
 obj_key_begin:
 #if YYJSON_IS_REAL_GCC
@@ -6490,6 +6565,7 @@ obj_key_begin:
         else break;
     })
 #endif
+obj_key_ready:
     if (likely(*cur == '"')) {
         val_incr();
         ctn_len++;
@@ -6612,6 +6688,7 @@ obj_val_begin:
 obj_val_end:
     if (byte_match_2(cur, ",\n")) {
         cur += 2;
+        skip_indent(obj_key_ready);
         goto obj_key_begin;
     }
     if (likely(*cur == ',')) {
@@ -6619,10 +6696,12 @@ obj_val_end:
         goto obj_key_begin;
     }
     if (likely(*cur == '}')) {
+obj_val_end_close:
         cur++;
         goto obj_end;
     }
     if (char_is_space(*cur)) {
+        skip_close_indent('}', obj_val_end_close);
         cur = skip_spaces(cur + 1);
         goto obj_val_end;
     }
@@ -6645,6 +6724,7 @@ obj_end:
     if (unlikely(ctn == ctn_parent)) goto doc_end;
     ctn = ctn_parent;
     ctn_len = (usize)(ctn->tag >> YYJSON_TAG_BIT);
+    indent_close();
     if (*cur == '\n') cur++;
     if ((ctn->tag & YYJSON_TYPE_MASK) == YYJSON_TYPE_OBJ) {
         goto obj_val_end;
@@ -6689,11 +6769,15 @@ fail_comment:           return_err(cur, INVALID_COMMENT, MSG_COMMENT);
 fail_garbage:           return_err(cur, UNEXPECTED_CONTENT, MSG_GARBAGE);
 fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
 
+#undef skip_close_indent
+#undef skip_indent
+#undef indent_close
+#undef indent_open
+#undef indent_learn
 #undef val_incr
 #undef return_err
 }
 
-#undef read_root_pretty_attr
 
 
 /*==============================================================================
