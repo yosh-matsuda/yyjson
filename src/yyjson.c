@@ -389,6 +389,10 @@ uint32_t yyjson_version(void) {
 #define repeat8_incr(x)   { x(0)  x(1)  x(2)  x(3)  x(4)  x(5)  x(6)  x(7)  }
 #define repeat16_incr(x)  { x(0)  x(1)  x(2)  x(3)  x(4)  x(5)  x(6)  x(7)  \
                             x(8)  x(9)  x(10) x(11) x(12) x(13) x(14) x(15) }
+#define repeat32_incr(x)  { x(0)  x(1)  x(2)  x(3)  x(4)  x(5)  x(6)  x(7)  \
+                            x(8)  x(9)  x(10) x(11) x(12) x(13) x(14) x(15) \
+                            x(16) x(17) x(18) x(19) x(20) x(21) x(22) x(23) \
+                            x(24) x(25) x(26) x(27) x(28) x(29) x(30) x(31) }
 #define repeat_in_1_18(x) { x(1)  x(2)  x(3)  x(4)  x(5)  x(6)  x(7)  x(8)  \
                             x(9)  x(10) x(11) x(12) x(13) x(14) x(15) x(16) \
                             x(17) x(18) }
@@ -2273,9 +2277,8 @@ static_inline u32 str_stop_mask_sse2(__m128i chunk) {
  whole load -> compare -> movemask -> tzcnt chain on the loop-carried dependency
  that runs through every string of the document. Instead the mask only steers a
  branch, so `src` always advances by a compile-time constant and the caller can
- resolve the final bytes with its scalar unrolled loop, whose exits are likewise
- constant offsets. This keeps short strings as fast as the scalar-only build
- while long strings still get the full SIMD throughput.
+ resolve the final bytes with its head dispatch (or its scalar unrolled loop),
+ whose exits are likewise constant offsets.
 
  Only the widest available chunk size is used. A narrower fallback pass would
  only ever apply to the last few bytes of the input, while its extra inlined
@@ -2292,9 +2295,9 @@ static_inline u8 *str_ascii_skip_chunks(u8 *src, u8 *eof) {
             if (mask) {
                 keep_branch();
 #if YYJSON_IS_REAL_GCC
-                /* Narrow the hit down to the 16-byte half that holds it, so
-                   the caller's 16-byte scalar round never rescans a clean
-                   half. Testing the mask that was computed anyway keeps this
+                /* Narrow the hit down to the 16-byte half that holds it,
+                   which starts the caller's next chunk test right at it.
+                   Testing the mask that was computed anyway keeps this
                    a predicted branch plus a constant add.
 
                    This is a pure hint, the caller resolves the same bytes
@@ -5203,6 +5206,45 @@ skip_ascii:
      })
      */
     if (quo == '"') {
+#if YYJSON_HAS_SIMD_SSE2
+    /*
+     With SIMD, the first chunk of the string is tested at once and the exact
+     stop position is dispatched through a jump table. Every case advances
+     `src` by a constant, so the position is predicted by the indirect branch
+     like the exits of the unrolled round below, instead of waiting for the
+     result of `count_trailing_zeros(mask)`. This replaces a load, a table
+     lookup and a branch per byte with a few instructions per string.
+     */
+#if YYJSON_HAS_SIMD_AVX2
+#define str_head_size 32
+#define str_head_mask(src) str_stop_mask_avx2( \
+    _mm256_loadu_si256((const __m256i *)(const void *)(src)))
+#define str_head_cases repeat32_incr
+#else
+#define str_head_size 16
+#define str_head_mask(src) str_stop_mask_sse2( \
+    _mm_loadu_si128((const __m128i *)(const void *)(src)))
+#define str_head_cases repeat16_incr
+#endif
+#define expr_case(i) case i: src += i; goto skip_ascii_end;
+    if (simd_chunk_fits(src, eof, str_head_size)) {
+        tmp = str_head_mask(src);
+        if (likely(tmp)) {
+            switch (u64_tz_bits(tmp)) {
+                str_head_cases(expr_case)
+                default: break;
+            }
+        }
+        src += str_head_size;
+        src = str_ascii_skip_chunks(src, eof);
+        goto skip_ascii;
+    }
+#undef expr_case
+#undef str_head_cases
+#undef str_head_mask
+#undef str_head_size
+#endif
+
 #define expr_jump(i) \
     if (likely(char_is_ascii_skip(src[i]))) {} \
     else goto skip_ascii_stop##i;
@@ -5212,14 +5254,13 @@ skip_ascii:
     src += i; \
     goto skip_ascii_end;
 
+    /* With SIMD, only the tail of the input where no chunk fits gets here. */
     repeat16_incr(expr_jump)
     src += 16;
 #if YYJSON_HAS_SIMD_SSE2
     /*
-     Only strings longer than this first unrolled round reach the SIMD scan,
-     so short strings keep the exact cost of the scalar-only build.
-     The scan merely reports which chunk holds the terminator; the unrolled
-     round above resolves the exact byte. See str_ascii_skip_chunks().
+     The head test above did not fit, so this scan fails its bound check at
+     once. It is kept because GCC lays out the string parser worse without it.
      */
     src = str_ascii_skip_chunks(src, eof);
 #endif
@@ -5435,7 +5476,8 @@ copy_ascii:
     byte_move_16(dst, src);
     dst += 16; src += 16;
 #if YYJSON_HAS_SIMD_SSE2
-    /* See the matching comment in the skip loop of `read_str_opt()`. */
+    /* Only strings longer than the unrolled round above reach the SIMD copy,
+       which leaves the exact stop to that round. See str_ascii_copy_chunks(). */
     if (quo == '"') {
         str_pos_pair simd_pos = str_ascii_copy_chunks(src, dst, eof);
         src = simd_pos.src;
