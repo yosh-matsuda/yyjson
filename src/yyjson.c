@@ -9372,7 +9372,8 @@ static_inline u8 *write_f64_xjb(u8 *buf, u64 sig_raw, u32 exp_raw) {
  2. Keep the decimal point to indicate that the number is floating-point.
  3. Remove positive sign in the exponent part.
  */
-static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
+static_inline u8 *write_f64_raw_inline(u8 *buf, u64 raw,
+                                       yyjson_write_flag flg) {
     u64 sig_bin, sig_dec, sig_raw;
     i32 exp_bin, exp_dec, sig_len, dot_ofs;
     u32 exp_raw;
@@ -9497,6 +9498,11 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
         return write_f64_exp(exp_dec, end);
     }
 #endif
+}
+
+/** Write a double number (requires 40 bytes buffer). */
+static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
+    return write_f64_raw_inline(buf, raw, flg);
 }
 
 /**
@@ -9746,6 +9752,12 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
 }
 
 /** Write a double number (requires 40 bytes buffer). */
+static_inline u8 *write_f64_raw_inline(u8 *buf, u64 raw,
+                                       yyjson_write_flag flg) {
+    return write_f64_raw(buf, raw, flg);
+}
+
+/** Write a double number (requires 40 bytes buffer). */
 static_noinline u8 *write_f32_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
 #if defined(FLT_DECIMAL_DIG) && FLT_DECIMAL_DIG < F32_DEC_DIG
     int dig = FLT_DECIMAL_DIG;
@@ -9827,7 +9839,7 @@ char *yyjson_write_number(const yyjson_val *val, char *buf) {
             u32 fmt = (u32)(val->tag >> 32);
             u32 flg = YYJSON_WRITE_ALLOW_INF_AND_NAN;
             if (likely(!(fmt >> (32 - YYJSON_WRITE_FP_FLAG_BITS)))) {
-                buf = (char *)write_f64_raw((u8 *)buf, raw, flg);
+                buf = (char *)write_f64_raw_inline((u8 *)buf, raw, flg);
             } else if (fmt >> (32 - YYJSON_WRITE_FP_PREC_BITS)) {
                 u32 prec = fmt >> (32 - YYJSON_WRITE_FP_PREC_BITS);
                 buf = (char *)write_f64_raw_fixed((u8 *)buf, raw, flg, prec);
