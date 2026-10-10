@@ -9524,9 +9524,14 @@ static_inline u8 *write_f64_xjb(u8 *buf, u64 sig_raw, u32 exp_raw) {
         exp_pos = exp_pos - lz + (exp_pos - lz != 1);
     }
     exp_res = xjb_f64_exp_table[e10 + 324];
-    buf = dst + exp_pos;
-    memcpy(buf, &exp_res, 8);
-    return buf + (exp_res >> 56);
+    memcpy(dst + exp_pos, &exp_res, 8);
+    /* The end waits for the digits, so add their length last, after the
+       length of the exponent; GCC would otherwise add it first. */
+    buf = dst + (exp_res >> 56);
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__("" : "+r"(buf));
+#endif
+    return buf + exp_pos;
 }
 
 #endif /* YYJSON_WRITE_F64_XJB */
