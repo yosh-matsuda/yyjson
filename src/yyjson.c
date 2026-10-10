@@ -10383,25 +10383,36 @@ static_inline u8 *write_raw(u8 *cur, const u8 *raw, usize raw_len) {
  @return The buffer cursor after string.
  */
 static_inline u8 *write_str_noesc(u8 *cur, const u8 *str, usize str_len) {
+    /*
+     The tail is copied as two overlapping blocks instead of a loop, so that a
+     short string such as an object key takes a few branches. A byte loop here
+     is vectorized by Clang, which puts several runtime checks in front of it.
+     */
+    u8 *end = cur + 1 + str_len;
     *cur++ = '"';
-    while (str_len >= 16) {
-        byte_copy_16(cur, str);
-        cur += 16;
-        str += 16;
-        str_len -= 16;
-    }
-    while (str_len >= 4) {
+    if (str_len >= 16) {
+        const u8 *src_end = str + str_len;
+        while (str_len > 16) {
+            byte_copy_16(cur, str);
+            cur += 16;
+            str += 16;
+            str_len -= 16;
+        }
+        byte_copy_16(end - 16, src_end - 16);
+    } else if (str_len >= 8) {
+        byte_copy_8(cur, str);
+        byte_copy_8(end - 8, str + str_len - 8);
+    } else if (str_len >= 4) {
         byte_copy_4(cur, str);
-        cur += 4;
-        str += 4;
-        str_len -= 4;
+        byte_copy_4(end - 4, str + str_len - 4);
+    } else if (str_len >= 2) {
+        byte_copy_2(cur, str);
+        byte_copy_2(end - 2, str + str_len - 2);
+    } else if (str_len) {
+        *cur = *str;
     }
-    while (str_len) {
-        *cur++ = *str++;
-        str_len -= 1;
-    }
-    *cur++ = '"';
-    return cur;
+    *end++ = '"';
+    return end;
 }
 
 #if YYJSON_HAS_SIMD_SSE2
